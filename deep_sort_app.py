@@ -6,12 +6,14 @@ import os
 
 import cv2
 import numpy as np
+import skvideo.io
 
 from application_util import preprocessing
 from application_util import visualization
 from deep_sort import nn_matching
 from deep_sort.detection import Detection
 from deep_sort.tracker import Tracker
+from tools import generate_detections 
 
 
 def gather_sequence_info(sequence_dir, detection_file):
@@ -125,7 +127,7 @@ def create_detections(detection_mat, frame_idx, min_height=0):
         detection_list.append(Detection(bbox, confidence, feature))
     return detection_list
 
-
+PATH_TO_TENSORFLOW_CHECKPOINT_FILE = 'networks/mars-small128.pb'
 def run(sequence_dir, detection_file, output_file, min_confidence,
         nms_max_overlap, min_detection_height, max_cosine_distance,
         nn_budget, display):
@@ -157,10 +159,24 @@ def run(sequence_dir, detection_file, output_file, min_confidence,
         If True, show visualization of intermediate tracking results.
 
     """
-    seq_info = gather_sequence_info(sequence_dir, detection_file)
+    is_video = os.path.splitext(sequence_dir)[1] == '.mp4'
+    if is_video:
+        bbox_detections = np.loadtxt(detection_file, delimiter=',')
+        vreader = skvideo.io.vreader(sequence_dir)
+        encoder = generate_detections.create_box_encoder_tf_crop(
+            PATH_TO_TENSORFLOW_CHECKPOINT_FILE)
+        # Metadata for seq_info.
+        metadata = skvideo.io.ffprobe(sequence_dir)['video']
+        num_frames = int(metadata['@nb_frames'])
+        height, width = int(metadata['@height']), int(metadata['@width'])
+        seq_info = {'min_frame_idx': 0, 'max_frame_idx': num_frames - 1,
+                    'image_size': (height, width),
+                    'sequence_name': sequence_dir}
+    else:
+        seq_info = gather_sequence_info(sequence_dir, detection_file)
     metric = nn_matching.NearestNeighborDistanceMetric(
         "cosine", max_cosine_distance, nn_budget)
-    tracker = Tracker(metric)
+    tracker = Tracker(metric, max_age=10)
     results = []
 
     def frame_callback(vis, frame_idx):
@@ -198,17 +214,65 @@ def run(sequence_dir, detection_file, output_file, min_confidence,
             results.append([
                 frame_idx, track.track_id, bbox[0], bbox[1], bbox[2], bbox[3]])
 
+    def frame_video_callback(vis, frame_idx):
+        if frame_idx % 100 == 0:
+            print("Processing frame %05d" % frame_idx)
+
+        # Load image and generate detections.
+        image = next(vreader) # Assume sequential.
+        bboxes = []
+        for bbox in bbox_detections[bbox_detections[:, 0] == frame_idx]:
+            bbox[1:] *= [height, width, height, width]
+            yxhw = np.hstack([bbox[1:3], bbox[3:5] - bbox[1:3]])
+            xywh = np.array([yxhw[1], yxhw[0], yxhw[3], yxhw[2]])
+            bboxes.append(xywh)
+
+        if len(bboxes) > 0:
+            features = encoder(image, bboxes)
+            detections = [Detection(bbox, 1.0, feature) for bbox, feature in
+                          zip(bboxes, features)]
+
+            # Run non-maxima suppression.
+            boxes = np.array([d.tlwh for d in detections])
+            scores = np.array([d.confidence for d in detections])
+            indices = preprocessing.non_max_suppression(
+                boxes, nms_max_overlap, scores)
+            detections = [detections[i] for i in indices]
+        else:
+            detections = []
+
+        # Update tracker.
+        tracker.predict()
+        tracker.update(detections)
+
+        # Update visualization.
+        if display:
+            vis.set_image(image.copy())
+            vis.draw_detections(detections)
+            vis.draw_trackers(tracker.tracks)
+
+        # Store results.
+        for track in tracker.tracks:
+            if not track.is_confirmed() or track.time_since_update > 1:
+                continue
+            bbox = track.to_tlwh()
+            bbox /= [width, height, width, height]
+            results.append([
+                frame_idx, track.track_id, bbox[0], bbox[1], bbox[2], bbox[3]])
+
+    callback = frame_video_callback if is_video else frame_callback
+
     # Run tracker.
     if display:
         visualizer = visualization.Visualization(seq_info, update_ms=5)
     else:
         visualizer = visualization.NoVisualization(seq_info)
-    visualizer.run(frame_callback)
+    visualizer.run(callback)
 
     # Store results.
     f = open(output_file, 'w')
     for row in results:
-        print('%d,%d,%.2f,%.2f,%.2f,%.2f,1,-1,-1,-1' % (
+        print('%d,%d,%.5f,%.5f,%.5f,%.5f,1,-1,-1,-1' % (
             row[0], row[1], row[2], row[3], row[4], row[5]),file=f)
 
 
@@ -245,7 +309,7 @@ def parse_args():
         "gallery. If None, no budget is enforced.", type=int, default=None)
     parser.add_argument(
         "--display", help="Show intermediate tracking results",
-        default=True, type=bool)
+        default=False, type=bool)
     return parser.parse_args()
 
 
