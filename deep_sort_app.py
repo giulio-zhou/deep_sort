@@ -163,7 +163,7 @@ def run(sequence_dir, detection_file, output_file, min_confidence,
     if is_video:
         bbox_detections = np.loadtxt(detection_file, delimiter=',')
         vreader = skvideo.io.vreader(sequence_dir)
-        encoder = generate_detections.create_box_encoder_tf_crop(
+        encoder = generate_detections.create_box_encoder(
             PATH_TO_TENSORFLOW_CHECKPOINT_FILE)
         # Metadata for seq_info.
         metadata = skvideo.io.ffprobe(sequence_dir)['video']
