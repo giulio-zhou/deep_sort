@@ -164,7 +164,8 @@ def run(sequence_dir, detection_file, output_file, min_confidence,
         bbox_detections = np.loadtxt(detection_file, delimiter=',')
         vreader = skvideo.io.vreader(sequence_dir)
         encoder = generate_detections.create_box_encoder(
-            PATH_TO_TENSORFLOW_CHECKPOINT_FILE)
+            PATH_TO_TENSORFLOW_CHECKPOINT_FILE,
+            input_name='inputs', output_name='outputs')
         # Metadata for seq_info.
         metadata = skvideo.io.ffprobe(sequence_dir)['video']
         num_frames = int(metadata['@nb_frames'])
@@ -176,7 +177,7 @@ def run(sequence_dir, detection_file, output_file, min_confidence,
         seq_info = gather_sequence_info(sequence_dir, detection_file)
     metric = nn_matching.NearestNeighborDistanceMetric(
         "cosine", max_cosine_distance, nn_budget)
-    tracker = Tracker(metric, max_age=10)
+    tracker = Tracker(metric, max_age=30)
     results = []
 
     def frame_callback(vis, frame_idx):
@@ -220,17 +221,20 @@ def run(sequence_dir, detection_file, output_file, min_confidence,
 
         # Load image and generate detections.
         image = next(vreader) # Assume sequential.
-        bboxes = []
+        bboxes, scores = [], []
         for bbox in bbox_detections[bbox_detections[:, 0] == frame_idx]:
-            bbox[1:] *= [height, width, height, width]
+            bbox[1:5] *= [height, width, height, width]
+            score = bbox[5]
             yxhw = np.hstack([bbox[1:3], bbox[3:5] - bbox[1:3]])
             xywh = np.array([yxhw[1], yxhw[0], yxhw[3], yxhw[2]])
             bboxes.append(xywh)
+            scores.append(score)
 
         if len(bboxes) > 0:
             features = encoder(image, bboxes)
-            detections = [Detection(bbox, 1.0, feature) for bbox, feature in
-                          zip(bboxes, features)]
+            detections = \
+                [Detection(bbox, score, feature) for bbox, score, feature in
+                 zip(bboxes, scores, features)]
 
             # Run non-maxima suppression.
             boxes = np.array([d.tlwh for d in detections])
@@ -255,10 +259,12 @@ def run(sequence_dir, detection_file, output_file, min_confidence,
         for track in tracker.tracks:
             if not track.is_confirmed() or track.time_since_update > 1:
                 continue
-            bbox = track.to_tlwh()
+            # bbox = track.to_tlbr()
+            bbox = track.update_history[-1].to_tlbr()
             bbox /= [width, height, width, height]
+            conf = track.update_history[-1].confidence
             results.append([
-                frame_idx, track.track_id, bbox[0], bbox[1], bbox[2], bbox[3]])
+                frame_idx, track.track_id, bbox[0], bbox[1], bbox[2], bbox[3], conf])
 
     callback = frame_video_callback if is_video else frame_callback
 
@@ -271,9 +277,10 @@ def run(sequence_dir, detection_file, output_file, min_confidence,
 
     # Store results.
     f = open(output_file, 'w')
+    f.write('frame_no,obj_id,xmin,ymin,xmax,ymax,conf\n')
     for row in results:
-        print('%d,%d,%.5f,%.5f,%.5f,%.5f,1,-1,-1,-1' % (
-            row[0], row[1], row[2], row[3], row[4], row[5]),file=f)
+        print('%d,%d,%.5f,%.5f,%.5f,%.5f,%.5f' % (
+            row[0], row[1], row[2], row[3], row[4], row[5], row[6]),file=f)
 
 
 def parse_args():
@@ -293,7 +300,7 @@ def parse_args():
     parser.add_argument(
         "--min_confidence", help="Detection confidence threshold. Disregard "
         "all detections that have a confidence lower than this value.",
-        default=0.8, type=float)
+        default=0.3, type=float)
     parser.add_argument(
         "--min_detection_height", help="Threshold on the detection bounding "
         "box height. Detections with height smaller than this value are "
